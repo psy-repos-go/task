@@ -7,12 +7,15 @@ import (
 	"io"
 	"log"
 	"os"
-	"sort"
 	"strings"
 	"text/tabwriter"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/go-task/task/v3/internal/editors"
+	"github.com/go-task/task/v3/internal/fingerprint"
 	"github.com/go-task/task/v3/internal/logger"
+	"github.com/go-task/task/v3/internal/sort"
 	"github.com/go-task/task/v3/taskfile"
 )
 
@@ -126,38 +129,68 @@ func (e *Executor) ListTaskNames(allTasks bool) {
 	if e.Stdout != nil {
 		w = e.Stdout
 	}
-	// create a string slice from all map values (*taskfile.Task)
-	s := make([]string, 0, len(e.Taskfile.Tasks))
-	for _, t := range e.Taskfile.Tasks {
-		if (allTasks || t.Desc != "") && !t.Internal {
-			s = append(s, strings.TrimRight(t.Task, ":"))
-			for _, alias := range t.Aliases {
-				s = append(s, strings.TrimRight(alias, ":"))
+
+	// Get the list of tasks and sort them
+	tasks := e.Taskfile.Tasks.Values()
+
+	// Sort the tasks
+	if e.TaskSorter == nil {
+		e.TaskSorter = &sort.AlphaNumericWithRootTasksFirst{}
+	}
+	e.TaskSorter.Sort(tasks)
+
+	// Create a list of task names
+	taskNames := make([]string, 0, e.Taskfile.Tasks.Len())
+	for _, task := range tasks {
+		if (allTasks || task.Desc != "") && !task.Internal {
+			taskNames = append(taskNames, strings.TrimRight(task.Task, ":"))
+			for _, alias := range task.Aliases {
+				taskNames = append(taskNames, strings.TrimRight(alias, ":"))
 			}
 		}
 	}
-	// sort and print all task names
-	sort.Strings(s)
-	for _, t := range s {
+	for _, t := range taskNames {
 		fmt.Fprintln(w, t)
 	}
 }
 
-func (e *Executor) ToEditorOutput(tasks []*taskfile.Task) (*editors.Output, error) {
-	o := &editors.Output{
-		Tasks: make([]editors.Task, len(tasks)),
+func (e *Executor) ToEditorOutput(tasks []*taskfile.Task) (*editors.Taskfile, error) {
+	o := &editors.Taskfile{
+		Tasks:    make([]editors.Task, len(tasks)),
+		Location: e.Taskfile.Location,
 	}
-	for i, t := range tasks {
-		upToDate, err := e.isTaskUpToDate(context.Background(), t)
-		if err != nil {
-			return nil, err
-		}
-		o.Tasks[i] = editors.Task{
-			Name:     t.Name(),
-			Desc:     t.Desc,
-			Summary:  t.Summary,
-			UpToDate: upToDate,
-		}
+	var g errgroup.Group
+	for i := range tasks {
+		task := tasks[i]
+		j := i
+		g.Go(func() error {
+			// Get the fingerprinting method to use
+			method := e.Taskfile.Method
+			if task.Method != "" {
+				method = task.Method
+			}
+			upToDate, err := fingerprint.IsTaskUpToDate(context.Background(), task,
+				fingerprint.WithMethod(method),
+				fingerprint.WithTempDir(e.TempDir),
+				fingerprint.WithDry(e.Dry),
+				fingerprint.WithLogger(e.Logger),
+			)
+			if err != nil {
+				return err
+			}
+			o.Tasks[j] = editors.Task{
+				Name:     task.Name(),
+				Desc:     task.Desc,
+				Summary:  task.Summary,
+				UpToDate: upToDate,
+				Location: &editors.Location{
+					Line:     task.Location.Line,
+					Column:   task.Location.Column,
+					Taskfile: task.Location.Taskfile,
+				},
+			}
+			return nil
+		})
 	}
-	return o, nil
+	return o, g.Wait()
 }

@@ -10,7 +10,7 @@ const NamespaceSeparator = ":"
 
 // Merge merges the second Taskfile into the first
 func Merge(t1, t2 *Taskfile, includedTaskfile *IncludedTaskfile, namespaces ...string) error {
-	if t1.Version != t2.Version {
+	if !t1.Version.Equal(t2.Version) {
 		return fmt.Errorf(`task: Taskfiles versions should match. First is "%s" but second is "%s"`, t1.Version, t2.Version)
 	}
 
@@ -30,10 +30,7 @@ func Merge(t1, t2 *Taskfile, includedTaskfile *IncludedTaskfile, namespaces ...s
 	t1.Vars.Merge(t2.Vars)
 	t1.Env.Merge(t2.Env)
 
-	if t1.Tasks == nil {
-		t1.Tasks = make(Tasks)
-	}
-	for k, v := range t2.Tasks {
+	return t2.Tasks.Range(func(k string, v *Task) error {
 		// We do a deep copy of the task struct here to ensure that no data can
 		// be changed elsewhere once the taskfile is merged.
 		task := v.DeepCopy()
@@ -65,10 +62,12 @@ func Merge(t1, t2 *Taskfile, includedTaskfile *IncludedTaskfile, namespaces ...s
 		}
 
 		// Add the task to the merged taskfile
-		t1.Tasks[taskNameWithNamespace(k, namespaces...)] = task
-	}
+		taskNameWithNamespace := taskNameWithNamespace(k, namespaces...)
+		task.Task = taskNameWithNamespace
+		t1.Tasks.Set(taskNameWithNamespace, task)
 
-	return nil
+		return nil
+	})
 }
 
 func taskNameWithNamespace(taskName string, namespaces ...string) string {

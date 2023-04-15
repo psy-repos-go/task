@@ -8,7 +8,7 @@ import (
 
 	"github.com/go-task/task/v3/internal/execext"
 	"github.com/go-task/task/v3/internal/filepathext"
-	"github.com/go-task/task/v3/internal/status"
+	"github.com/go-task/task/v3/internal/fingerprint"
 	"github.com/go-task/task/v3/internal/templater"
 	"github.com/go-task/task/v3/taskfile"
 )
@@ -40,12 +40,7 @@ func (e *Executor) compiledTask(call taskfile.Call, evaluateShVars bool) (*taskf
 		return nil, err
 	}
 
-	v, err := e.Taskfile.ParsedVersion()
-	if err != nil {
-		return nil, err
-	}
-
-	r := templater.Templater{Vars: vars, RemoveNoValue: v >= 3.0}
+	r := templater.Templater{Vars: vars, RemoveNoValue: e.Taskfile.Version.Compare(taskfile.V3) >= 0}
 
 	new := taskfile.Task{
 		Task:                 origTask.Task,
@@ -71,6 +66,7 @@ func (e *Executor) compiledTask(call taskfile.Call, evaluateShVars bool) (*taskf
 		IncludeVars:          origTask.IncludeVars,
 		IncludedTaskfileVars: origTask.IncludedTaskfileVars,
 		Platforms:            origTask.Platforms,
+		Location:             origTask.Location,
 	}
 	new.Dir, err = execext.Expand(new.Dir)
 	if err != nil {
@@ -95,7 +91,7 @@ func (e *Executor) compiledTask(call taskfile.Call, evaluateShVars bool) (*taskf
 				return nil, err
 			}
 			for key, value := range envs {
-				if _, ok := dotenvEnvs.Mapping[key]; !ok {
+				if ok := dotenvEnvs.Exists(key); !ok {
 					dotenvEnvs.Set(key, taskfile.Var{Static: value})
 				}
 			}
@@ -166,8 +162,11 @@ func (e *Executor) compiledTask(call taskfile.Call, evaluateShVars bool) (*taskf
 	}
 
 	if len(origTask.Status) > 0 {
-		for _, checker := range []status.Checker{e.timestampChecker(&new), e.checksumChecker(&new)} {
-			value, err := checker.Value()
+		timestampChecker := fingerprint.NewTimestampChecker(e.TempDir, e.Dry)
+		checksumChecker := fingerprint.NewChecksumChecker(e.TempDir, e.Dry)
+
+		for _, checker := range []fingerprint.SourcesCheckable{timestampChecker, checksumChecker} {
+			value, err := checker.Value(&new)
 			if err != nil {
 				return nil, err
 			}

@@ -7,15 +7,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var (
-	// ErrCantUnmarshalPrecondition is returned for invalid precond YAML.
-	ErrCantUnmarshalPrecondition = errors.New("task: Can't unmarshal precondition value")
-)
+// ErrCantUnmarshalPrecondition is returned for invalid precond YAML.
+var ErrCantUnmarshalPrecondition = errors.New("task: Can't unmarshal precondition value")
 
 // Precondition represents a precondition necessary for a task to run
 type Precondition struct {
 	Sh  string
 	Msg string
+}
+
+func (p *Precondition) DeepCopy() *Precondition {
+	if p == nil {
+		return nil
+	}
+	return &Precondition{
+		Sh:  p.Sh,
+		Msg: p.Msg,
+	}
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler interface.

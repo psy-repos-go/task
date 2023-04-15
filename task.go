@@ -6,17 +6,18 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-task/task/v3/internal/compiler"
+	"github.com/go-task/task/v3/internal/env"
 	"github.com/go-task/task/v3/internal/execext"
+	"github.com/go-task/task/v3/internal/fingerprint"
 	"github.com/go-task/task/v3/internal/logger"
 	"github.com/go-task/task/v3/internal/output"
 	"github.com/go-task/task/v3/internal/slicesext"
+	"github.com/go-task/task/v3/internal/sort"
 	"github.com/go-task/task/v3/internal/summary"
 	"github.com/go-task/task/v3/internal/templater"
 	"github.com/go-task/task/v3/taskfile"
@@ -58,6 +59,7 @@ type Executor struct {
 	Compiler    compiler.Compiler
 	Output      output.Output
 	OutputStyle taskfile.Output
+	TaskSorter  sort.TaskSorter
 
 	taskvars   *taskfile.Vars
 	fuzzyModel *fuzzy.Model
@@ -157,13 +159,24 @@ func (e *Executor) RunTask(ctx context.Context, call taskfile.Call) error {
 				return err
 			}
 
-			upToDate, err := e.isTaskUpToDate(ctx, t)
+			// Get the fingerprinting method to use
+			method := e.Taskfile.Method
+			if t.Method != "" {
+				method = t.Method
+			}
+
+			upToDate, err := fingerprint.IsTaskUpToDate(ctx, t,
+				fingerprint.WithMethod(method),
+				fingerprint.WithTempDir(e.TempDir),
+				fingerprint.WithDry(e.Dry),
+				fingerprint.WithLogger(e.Logger),
+			)
 			if err != nil {
 				return err
 			}
 
 			if upToDate && preCondMet {
-				if !e.Silent {
+				if e.Verbose || (!t.Silent && !e.Taskfile.Silent && !e.Silent) {
 					e.Logger.Errf(logger.Magenta, `task: Task "%s" is up to date`, t.Name())
 				}
 				return nil
@@ -282,22 +295,20 @@ func (e *Executor) runCommand(ctx context.Context, t *taskfile.Task, call taskfi
 			return fmt.Errorf("task: failed to get variables: %w", err)
 		}
 		stdOut, stdErr, close := outputWrapper.WrapWriter(e.Stdout, e.Stderr, t.Prefix, outputTemplater)
-		defer func() {
-			if err := close(); err != nil {
-				e.Logger.Errf(logger.Red, "task: unable to close writer: %v", err)
-			}
-		}()
 
 		err = execext.RunCommand(ctx, &execext.RunCommandOptions{
 			Command:   cmd.Cmd,
 			Dir:       t.Dir,
-			Env:       getEnviron(t),
+			Env:       env.Get(t),
 			PosixOpts: slicesext.UniqueJoin(e.Taskfile.Set, t.Set, cmd.Set),
 			BashOpts:  slicesext.UniqueJoin(e.Taskfile.Shopt, t.Shopt, cmd.Shopt),
 			Stdin:     e.Stdin,
 			Stdout:    stdOut,
 			Stderr:    stdErr,
 		})
+		if closeErr := close(err); closeErr != nil {
+			e.Logger.Errf(logger.Red, "task: unable to close writer: %v", closeErr)
+		}
 		if execext.IsExitError(err) && cmd.IgnoreError {
 			e.Logger.VerboseErrf(logger.Yellow, "task: [%s] command error ignored: %v", t.Name(), err)
 			return nil
@@ -306,29 +317,6 @@ func (e *Executor) runCommand(ctx context.Context, t *taskfile.Task, call taskfi
 	default:
 		return nil
 	}
-}
-
-func getEnviron(t *taskfile.Task) []string {
-	if t.Env == nil {
-		return nil
-	}
-
-	environ := os.Environ()
-
-	for k, v := range t.Env.ToCacheMap() {
-		str, isString := v.(string)
-		if !isString {
-			continue
-		}
-
-		if _, alreadySet := os.LookupEnv(k); alreadySet {
-			continue
-		}
-
-		environ = append(environ, fmt.Sprintf("%s=%s", k, str))
-	}
-
-	return environ
 }
 
 func (e *Executor) startExecution(ctx context.Context, t *taskfile.Task, execute func(ctx context.Context) error) error {
@@ -342,11 +330,15 @@ func (e *Executor) startExecution(ctx context.Context, t *taskfile.Task, execute
 	}
 
 	e.executionHashesMutex.Lock()
-	otherExecutionCtx, ok := e.executionHashes[h]
 
-	if ok {
+	if otherExecutionCtx, ok := e.executionHashes[h]; ok {
 		e.executionHashesMutex.Unlock()
 		e.Logger.VerboseErrf(logger.Magenta, "task: skipping execution of task: %s", h)
+
+		// Release our execution slot to avoid blocking other tasks while we wait
+		reacquire := e.releaseConcurrencyLimit()
+		defer reacquire()
+
 		<-otherExecutionCtx.Done()
 		return nil
 	}
@@ -365,14 +357,14 @@ func (e *Executor) startExecution(ctx context.Context, t *taskfile.Task, execute
 // If multiple tasks contain the same alias or no matches are found an error is returned.
 func (e *Executor) GetTask(call taskfile.Call) (*taskfile.Task, error) {
 	// Search for a matching task
-	matchingTask, ok := e.Taskfile.Tasks[call.Task]
-	if ok {
+	matchingTask := e.Taskfile.Tasks.Get(call.Task)
+	if matchingTask != nil {
 		return matchingTask, nil
 	}
 
 	// If didn't find one, search for a task with a matching alias
 	var aliasedTasks []string
-	for _, task := range e.Taskfile.Tasks {
+	for _, task := range e.Taskfile.Tasks.Values() {
 		if slices.Contains(task.Aliases, call.Task) {
 			aliasedTasks = append(aliasedTasks, task.Task)
 			matchingTask = task
@@ -403,29 +395,33 @@ func (e *Executor) GetTask(call taskfile.Call) (*taskfile.Task, error) {
 type FilterFunc func(task *taskfile.Task) bool
 
 func (e *Executor) GetTaskList(filters ...FilterFunc) ([]*taskfile.Task, error) {
-	tasks := make([]*taskfile.Task, 0, len(e.Taskfile.Tasks))
+	tasks := make([]*taskfile.Task, 0, e.Taskfile.Tasks.Len())
 
 	// Create an error group to wait for each task to be compiled
 	var g errgroup.Group
 
-	// Fetch and compile the list of tasks
-	for key := range e.Taskfile.Tasks {
-		task := e.Taskfile.Tasks[key]
-		g.Go(func() error {
-
-			// Check if we should filter the task
-			for _, filter := range filters {
-				if filter(task) {
-					return nil
-				}
+	// Filter tasks based on the given filter functions
+	for _, task := range e.Taskfile.Tasks.Values() {
+		var shouldFilter bool
+		for _, filter := range filters {
+			if filter(task) {
+				shouldFilter = true
 			}
+		}
+		if !shouldFilter {
+			tasks = append(tasks, task)
+		}
+	}
 
-			// Compile the task
+	// Compile the list of tasks
+	for i := range tasks {
+		task := tasks[i]
+		g.Go(func() error {
 			compiledTask, err := e.FastCompiledTask(taskfile.Call{Task: task.Task})
 			if err == nil {
 				task = compiledTask
 			}
-			tasks = append(tasks, task)
+			task = compiledTask
 			return nil
 		})
 	}
@@ -435,20 +431,11 @@ func (e *Executor) GetTaskList(filters ...FilterFunc) ([]*taskfile.Task, error) 
 		return nil, err
 	}
 
-	// Sort the tasks.
-	// Tasks that are not namespaced should be listed before tasks that are.
-	// We detect this by searching for a ':' in the task name.
-	sort.Slice(tasks, func(i, j int) bool {
-		iContainsColon := strings.Contains(tasks[i].Task, ":")
-		jContainsColon := strings.Contains(tasks[j].Task, ":")
-		if iContainsColon == jContainsColon {
-			return tasks[i].Task < tasks[j].Task
-		}
-		if !iContainsColon && jContainsColon {
-			return true
-		}
-		return false
-	})
+	// Sort the tasks
+	if e.TaskSorter == nil {
+		e.TaskSorter = &sort.AlphaNumericWithRootTasksFirst{}
+	}
+	e.TaskSorter.Sort(tasks)
 
 	return tasks, nil
 }

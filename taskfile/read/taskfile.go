@@ -58,11 +58,6 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 		return nil, "", err
 	}
 
-	v, err := t.ParsedVersion()
-	if err != nil {
-		return nil, "", err
-	}
-
 	// Annotate any included Taskfile reference with a base directory for resolving relative paths
 	_ = t.Includes.Range(func(key string, includedFile taskfile.IncludedTaskfile) error {
 		// Set the base directory for resolving relative paths, but only if not already set
@@ -74,7 +69,7 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 	})
 
 	err = t.Includes.Range(func(namespace string, includedTask taskfile.IncludedTaskfile) error {
-		if v >= 3.0 {
+		if t.Version.Compare(taskfile.V3) >= 0 {
 			tr := templater.Templater{Vars: t.Vars, RemoveNoValue: true}
 			includedTask = taskfile.IncludedTaskfile{
 				Taskfile:       tr.Replace(includedTask.Taskfile),
@@ -123,7 +118,7 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 			return err
 		}
 
-		if v >= 3.0 && len(includedTaskfile.Dotenv) > 0 {
+		if t.Version.Compare(taskfile.V3) >= 0 && len(includedTaskfile.Dotenv) > 0 {
 			return ErrIncludedTaskfilesCantHaveDotenvs
 		}
 
@@ -133,18 +128,22 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 				return err
 			}
 
-			for k, v := range includedTaskfile.Vars.Mapping {
+			// nolint: errcheck
+			includedTaskfile.Vars.Range(func(k string, v taskfile.Var) error {
 				o := v
 				o.Dir = dir
-				includedTaskfile.Vars.Mapping[k] = o
-			}
-			for k, v := range includedTaskfile.Env.Mapping {
+				includedTaskfile.Vars.Set(k, o)
+				return nil
+			})
+			// nolint: errcheck
+			includedTaskfile.Env.Range(func(k string, v taskfile.Var) error {
 				o := v
 				o.Dir = dir
-				includedTaskfile.Env.Mapping[k] = o
-			}
+				includedTaskfile.Env.Set(k, o)
+				return nil
+			})
 
-			for _, task := range includedTaskfile.Tasks {
+			for _, task := range includedTaskfile.Tasks.Values() {
 				task.Dir = filepathext.SmartJoin(dir, task.Dir)
 				task.IncludeVars = includedTask.Vars
 				task.IncludedTaskfileVars = includedTaskfile.Vars
@@ -156,10 +155,12 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 			return err
 		}
 
-		if includedTaskfile.Tasks["default"] != nil && t.Tasks[namespace] == nil {
+		if includedTaskfile.Tasks.Get("default") != nil && t.Tasks.Get(namespace) == nil {
 			defaultTaskName := fmt.Sprintf("%s:default", namespace)
-			t.Tasks[defaultTaskName].Aliases = append(t.Tasks[defaultTaskName].Aliases, namespace)
-			t.Tasks[defaultTaskName].Aliases = append(t.Tasks[defaultTaskName].Aliases, includedTask.Aliases...)
+			task := t.Tasks.Get(defaultTaskName)
+			task.Aliases = append(task.Aliases, namespace)
+			task.Aliases = append(task.Aliases, includedTask.Aliases...)
+			t.Tasks.Set(defaultTaskName, task)
 		}
 
 		return nil
@@ -168,7 +169,7 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 		return nil, "", err
 	}
 
-	if v < 3.0 {
+	if t.Version.Compare(taskfile.V3) < 0 {
 		path = filepathext.SmartJoin(readerNode.Dir, fmt.Sprintf("Taskfile_%s.yml", runtime.GOOS))
 		if _, err = os.Stat(path); err == nil {
 			osTaskfile, err := readTaskfile(path)
@@ -181,12 +182,18 @@ func Taskfile(readerNode *ReaderNode) (*taskfile.Taskfile, string, error) {
 		}
 	}
 
-	for name, task := range t.Tasks {
+	// Set the location of the Taskfile
+	t.Location = path
+
+	for _, task := range t.Tasks.Values() {
+		// If the task is not defined, create a new one
 		if task == nil {
 			task = &taskfile.Task{}
-			t.Tasks[name] = task
 		}
-		task.Task = name
+		// Set the location of the taskfile for each task
+		if task.Location.Taskfile == "" {
+			task.Location.Taskfile = path
+		}
 	}
 
 	return t, readerNode.Dir, nil
@@ -262,8 +269,8 @@ func checkCircularIncludes(node *ReaderNode) error {
 	if node.Parent == nil {
 		return errors.New("task: failed to check for include cycle: node.Parent was nil")
 	}
-	var curNode = node
-	var basePath = filepathext.SmartJoin(node.Dir, node.Entrypoint)
+	curNode := node
+	basePath := filepathext.SmartJoin(node.Dir, node.Entrypoint)
 	for curNode.Parent != nil {
 		curNode = curNode.Parent
 		curPath := filepathext.SmartJoin(curNode.Dir, curNode.Entrypoint)
